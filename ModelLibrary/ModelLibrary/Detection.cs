@@ -7,7 +7,7 @@ using System.IO;
 using static Microsoft.ML.Transforms.Image.ImageResizingEstimator;
 using System.Threading.Tasks.Dataflow;
 using System.Threading.Tasks;
-
+using System.Collections.Concurrent;
 
 namespace ModelLibrary
 {
@@ -17,13 +17,16 @@ namespace ModelLibrary
         // https://github.com/onnx/models/tree/master/vision/object_detection_segmentation/yolov4
         const string modelPath = @"C:\prac\441_gryaznov\yolov4.onnx";
 
-        const string imageFolder = @"C:\prac\441_gryaznov\Assets\Images";
-
         const string imageOutputFolder = @"C:\prac\441_gryaznov\Assets\Output";
 
         static readonly string[] classesNames = new string[] { "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa", "pottedplant", "bed", "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush" };
 
-        public static async Task Detect()
+        public static BufferBlock<string> bufferBlock = new BufferBlock<string>();
+        public static BufferBlock<(string, string)> resultBufferBlock = new BufferBlock<(string, string)>();
+        public static CancellationTokenSource cancelTokenSource;
+        public static CancellationToken token;
+
+        public static async Task Detect(string imageFolder, int labNumber)
         {
             
             MLContext mlContext = new MLContext();
@@ -54,71 +57,64 @@ namespace ModelLibrary
                     },
                     modelFile: modelPath, recursionLimit: 100));
 
-            // Fit on empty list to obtain input data schema
             var model = pipeline.Fit(mlContext.Data.LoadFromEnumerable(new List<YoloV4BitmapData>()));
-
-            // Create prediction engine
             var predictionEngine = mlContext.Model.CreatePredictionEngine<YoloV4BitmapData, YoloV4Prediction>(model);
 
-            // save model
-            //mlContext.Model.Save(model, predictionEngine.OutputSchema, Path.ChangeExtension(modelPath, "zip"));
+            ConcurrentBag<YoloV4Result> detectedObjects = new ConcurrentBag<YoloV4Result>();
+            string[] imageNames = Directory.GetFiles(imageFolder);
+            ProcessedImages processedImages = new ProcessedImages(imageNames.Length);
+
+            Dictionary<string, ConcurrentBag<string>> recognizedObjects = new Dictionary<string, ConcurrentBag<string>>();
+
+            foreach (string name in classesNames)
+            {
+                recognizedObjects.Add(name, new ConcurrentBag<string>());
+            }
+
+            object locker = new object();
+
             var sw = new Stopwatch();
             sw.Start();
            
             string[] imageName = Directory.GetFiles(imageFolder);
 
 
-            var ab1 = new ActionBlock<int>(async x =>
-            {
-                using (var bitmap = new Bitmap(Image.FromFile(Path.Combine(imageFolder, imageName[x]))))
+            var ab1 = new ActionBlock<string>(async image => {
+                YoloV4Prediction predict;
+                string iName = Path.GetFileName(image);
+                if (labNumber == 1)
+                    Console.WriteLine($"Изображение {iName} в обработке");
+                lock (locker)
                 {
-                    // predict
-                    Console.WriteLine($"Начата обработка изображения {x + 1}");
-                    var predict = predictionEngine.Predict(new YoloV4BitmapData() { Image = bitmap });
-                    var results = predict.GetResults(classesNames, 0.3f, 0.7f);
+                    var bitmap = new Bitmap(Image.FromFile(Path.Combine(image)));
+                    predict = predictionEngine.Predict(new YoloV4BitmapData() { Image = bitmap });
+                }
 
-                    using (var g = Graphics.FromImage(bitmap))
+                var results = predict.GetResults(classesNames, 0.3f, 0.7f);
+                foreach (var res in results)
+                {
+                    recognizedObjects[res.Label].Add(image);
+                    if (labNumber == 1)
+                        Console.WriteLine($"Объект '{res.Label}' был найден на картинке {iName}");
+                    if (!token.IsCancellationRequested)
                     {
-                        var ab2 = new ActionBlock<YoloV4Result>(async y =>
-                        {
-                                // draw predictions
-                                var x1 = y.BBox[0];
-                            var y1 = y.BBox[1];
-                            var x2 = y.BBox[2];
-                            var y2 = y.BBox[3];
-                            g.DrawRectangle(Pens.Red, x1, y1, x2 - x1, y2 - y1);
-                            using (var brushes = new SolidBrush(Color.FromArgb(50, Color.Red)))
-                            {
-                                g.FillRectangle(brushes, x1, y1, x2 - x1, y2 - y1);
-                            }
-
-                            g.DrawString(y.Label + " " + y.Confidence.ToString("0.00"),
-                                            new Font("Arial", 12), Brushes.Blue, new PointF(x1, y1));
-                            Console.WriteLine($"[{x1}] [{x2}] [{y1}] [{y2}] : Объект - {y.Label} на фото номер {x + 1}");
-                            var r1 = new Random();
-                            await Task.Delay(r1.Next(1000));
-
-                        });
-                        Parallel.ForEach(results, res => ab2.Post(res));
-                        ab2.Complete();
-                        await ab2.Completion;
-                        var r = new Random();
-                        Console.WriteLine($"Закончена обработка изображения {x + 1}");
-                        await Task.Delay(r.Next(500));
-                    
-                        string FileName = Path.GetFileName(imageName[x]);
-                        string SavePath = Path.Combine(imageOutputFolder, Path.ChangeExtension(FileName, "_processed" + Path.GetExtension(FileName)));
-                        
-                        bitmap.Save(SavePath);
+                        await resultBufferBlock.SendAsync((res.Label, image));
                     }
                 }
+            },
+            new ExecutionDataflowBlockOptions
+            {
+                MaxDegreeOfParallelism = Environment.ProcessorCount,
+                CancellationToken = token
             });
-            Parallel.For(0, imageName.Length, i => ab1.Post(i));
-            ab1.Complete();
 
+            Parallel.For(0, imageNames.Length, i => ab1.Post(imageNames[i]));
+            ab1.Complete();
             await ab1.Completion;
+            await resultBufferBlock.SendAsync(("end", "end"));
+            await bufferBlock.SendAsync($"Total number of objects: {detectedObjects.Count}");
+            await bufferBlock.SendAsync("end");
             sw.Stop();
-            Console.WriteLine($"Done in {sw.ElapsedMilliseconds}ms.");
         }
     }
 }
