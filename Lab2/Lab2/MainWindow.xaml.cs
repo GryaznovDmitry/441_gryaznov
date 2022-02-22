@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
@@ -7,14 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Threading.Tasks.Dataflow;
 using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Data;
-using System.Windows.Documents;
-using System.Windows.Input;
-using System.Windows.Media;
-using System.Windows.Media.Imaging;
-using System.Windows.Navigation;
-using System.Windows.Shapes;
+using Microsoft.Data.Sqlite;
 using ModelLibrary;
 using Ookii.Dialogs.Wpf;
 
@@ -25,34 +19,25 @@ namespace Lab2
     /// </summary>
     public partial class MainWindow : Window
     {
-        public static ObservableCollection<Results> resultCollection = new ObservableCollection<Results>();
+        public static DetectedObjectContext db = new DetectedObjectContext();
+        public static ObservableCollection<DetectedObject> resultCollection = db.DetectedObjects.Local.ToObservableCollection();
 
-        private static async Task Consumer()
+        public static async Task Consumer()
         {
-            string type;
-            string image;
-
             while (true)
             {
-                (type, image) = await Detection.resultBufferBlock.ReceiveAsync();
-                if (type == "end")
+                DetectedObject? obj;
+
+                obj = await Detection.resultBufferBlock.ReceiveAsync();
+                if (obj == null)
                 {
+                    db.SaveChanges();
+                    MessageBox.Show("Ready");
                     break;
                 }
-
-                bool flag = true;
-                foreach (Results r in resultCollection)
+                else
                 {
-                    if (r.Info == type)
-                    {
-                        r.images.Add(image);
-                        flag = false;
-                        break;
-                    }
-                }
-                if (flag)
-                {
-                    resultCollection.Add(new Results(type, image));
+                    db.AddElem(obj);
                 }
             }
         }
@@ -61,6 +46,11 @@ namespace Lab2
         {
             InitializeComponent();
             DataContext = resultCollection;
+            foreach (var elem in db.DetectedObjects.ToArray())
+            {
+                resultCollection.Add(elem);
+            }
+            //Obj.ItemsSource = db.DetectedObjects.ToArray();
         }
 
         private void btnSelect_Click(object sender, RoutedEventArgs e)
@@ -73,11 +63,12 @@ namespace Lab2
         private async void btnRun_Click(object sender, RoutedEventArgs e)
         {
             btnRun.IsEnabled = false;
-            resultCollection.Clear();
+            //db.Clear();
             Detection.cancelTokenSource = new CancellationTokenSource();
             Detection.token = Detection.cancelTokenSource.Token;
 
-            await Task.WhenAll(Detection.Detect(TextBox_Path.Text, 2), Consumer());
+            await Task.WhenAll(Detection.Detect(TextBox_Path.Text, 3), Consumer());
+            //Obj.ItemsSource = db.DetectedObjects.ToArray();
             btnRun.IsEnabled = true;
         }
 
@@ -85,6 +76,21 @@ namespace Lab2
         {
             Detection.cancelTokenSource.Cancel();
             btnRun.IsEnabled = true;
+        }
+
+        private void btnDelete_Click(object sender, RoutedEventArgs e)
+        {
+            var obj = Obj.SelectedItem as DetectedObject;
+            var objId = obj.DetectedObjectId;
+            db.Delete(objId);
+            resultCollection.Remove(obj);
+            MessageBox.Show("Deleted");
+        }
+
+        private void btnClear_Click(object sender, RoutedEventArgs e)
+        {
+            db.Clear();
+            
         }
     }
 }

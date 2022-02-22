@@ -20,11 +20,20 @@ namespace ModelLibrary
         const string imageOutputFolder = @"C:\prac\441_gryaznov\Assets\Output";
 
         static readonly string[] classesNames = new string[] { "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa", "pottedplant", "bed", "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush" };
-
+        public static BufferBlock<DetectedObject> resultBufferBlock = new BufferBlock<DetectedObject>();
         public static BufferBlock<string> bufferBlock = new BufferBlock<string>();
-        public static BufferBlock<(string, string)> resultBufferBlock = new BufferBlock<(string, string)>();
+
         public static CancellationTokenSource cancelTokenSource;
         public static CancellationToken token;
+
+        public static byte[] ImageToByte(Image img)
+        {
+            using (var stream = new MemoryStream())
+            {
+                img.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
+                return stream.ToArray();
+            }
+        }
 
         public static async Task Detect(string imageFolder, int labNumber)
         {
@@ -62,7 +71,6 @@ namespace ModelLibrary
 
             ConcurrentBag<YoloV4Result> detectedObjects = new ConcurrentBag<YoloV4Result>();
             string[] imageNames = Directory.GetFiles(imageFolder);
-            ProcessedImages processedImages = new ProcessedImages(imageNames.Length);
 
             Dictionary<string, ConcurrentBag<string>> recognizedObjects = new Dictionary<string, ConcurrentBag<string>>();
 
@@ -91,14 +99,46 @@ namespace ModelLibrary
                 }
 
                 var results = predict.GetResults(classesNames, 0.3f, 0.7f);
+
                 foreach (var res in results)
                 {
                     recognizedObjects[res.Label].Add(image);
                     if (labNumber == 1)
                         Console.WriteLine($"Объект '{res.Label}' был найден на картинке {iName}");
+                    DetectedObject obj = new DetectedObject();
+                    var x1 = res.BBox[0];
+                    var y1 = res.BBox[1];
+                    var x2 = res.BBox[2];
+                    var y2 = res.BBox[3];
+                    var type = res.Label;
+
+                    Rectangle cropRect = new Rectangle((int)x1, (int)y1, (int)(x2 - x1), (int)(y2 - y1));
+                    Bitmap src = Image.FromFile(image) as Bitmap;
+                    Bitmap target = new Bitmap(cropRect.Width, cropRect.Height);
+                    Bitmap marker = Image.FromFile(image) as Bitmap;
+                    using (Graphics g = Graphics.FromImage(marker))
+                    {
+                        Pen RedPen = new Pen(Color.Red, 3);
+                        g.DrawRectangle(RedPen, cropRect);
+                    }
+                    obj.x1 = x1;
+                    obj.x2 = x2;
+                    obj.y1 = y1;
+                    obj.y2 = y2;
+                    obj.Type = type;
+                    obj.BitmapImageFull = ImageToByte(marker);
+                    using (Graphics g = Graphics.FromImage(target))
+                    {
+                        g.DrawImage(src, new Rectangle(0, 0, target.Width, target.Height), cropRect, GraphicsUnit.Pixel);
+                    }
+                    
+                    string imageOutputPath =$"{imageOutputFolder}/{res.Label}{x1}{y2}.jpg";
+                    obj.BitmapImageObj = ImageToByte(target);
+                    target.Save(imageOutputPath);
+
                     if (!token.IsCancellationRequested)
                     {
-                        await resultBufferBlock.SendAsync((res.Label, image));
+                        await resultBufferBlock.SendAsync(obj);
                     }
                 }
             },
@@ -111,9 +151,10 @@ namespace ModelLibrary
             Parallel.For(0, imageNames.Length, i => ab1.Post(imageNames[i]));
             ab1.Complete();
             await ab1.Completion;
-            await resultBufferBlock.SendAsync(("end", "end"));
+           // await resultBufferBlock.SendAsync();
             await bufferBlock.SendAsync($"Total number of objects: {detectedObjects.Count}");
             await bufferBlock.SendAsync("end");
+            await resultBufferBlock.SendAsync(null);
             sw.Stop();
         }
     }
